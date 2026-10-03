@@ -36,6 +36,7 @@ go run ./cmd/zrc \
 
 ```text
 cmd/zrc                     服务进程入口
+cmd/zrcimport               离线区域文件导入命令
 cmd/workflowprobe           工作流探针入口
 internal/domain             聚合、DNS 值校验、状态迁移和判定计算
 internal/store              锁内副本事务和原子 JSON 持久化
@@ -46,6 +47,7 @@ internal/allocation         节点选择和租约生命周期
 internal/probe              探针登记、幂等重放和租约完成
 internal/assessment         一致性聚合和最新结果查询
 internal/httpapi            HTTP 路由、中间件和响应映射
+internal/zonefile           传统区域文件解析、规范化和行号定位错误
 internal/workflowprobe      真实 HTTP 路径验证
 ```
 
@@ -135,6 +137,39 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
   -d '{"request_key": "assess-request-0001"}'
 ```
 
+## 离线导入区域文件
+
+运维手上的传统区域文件（master 格式）可以用 `zrcimport` 直接导入为草稿计划的区域版本，无需手工转换成 JSON。命令完全离线运行，不启动 HTTP 服务，但会锁定同一份 `<state>.lock`，因此请先停止 `zrc` 服务进程。
+
+```bash
+go run ./cmd/zrcimport \
+  --state data/zrc-state.json \
+  --plan <plan_id> \
+  --file zones/edge.example.zone \
+  --serial 2026100201 \
+  --authority ns1.edge.example
+```
+
+参数：
+
+- `--state`：JSON 状态快照路径，默认 `data/zrc-state.json`。
+- `--plan`：目标计划标识，计划必须处于 `draft`。
+- `--file`：传统区域文件路径，必须是 UTF-8 编码（可带 BOM）。
+- `--serial`：新版本序列号，1 到 4294967295，且必须大于计划内已有序列号。
+- `--authority`：版本权威名称。
+- `--origin`：相对名称的来源，默认取计划区域；文件内 `$ORIGIN` 指令可覆盖。
+- `--yes`：跳过交互确认直接写入。
+
+支持的语法：`;` 行尾注释、`( )` 跨行分组、`$ORIGIN` 与 `$TTL` 指令、`@` 表示来源、相对名称自动拼接来源、行首空白继承上一条 owner、可选的 TTL 与 `IN` 类。记录类型与 JSON 接口一致，只接受 `A`、`AAAA`、`CNAME`。
+
+行为：
+
+1. 文件在内存中完成解码、解析、规范化（小写、去末尾句点、地址规范化）、逐行重复检查和 500 条容量限制，随后再套用与 JSON 接口完全相同的领域校验。
+2. 校验通过后先打印将创建的版本摘要（序列号、权威、条目数、类型分布、内容指纹和条目预览），确认后才调用计划服务写入。
+3. 语法或值错误定位到具体行号，任何失败都不会部分入库。
+4. 同一文件重复导入时按规范化内容识别身份：完全相同的版本已存在时直接提示并退出，不重复写入。
+5. 写入事务按预览时的计划版本做乐观并发校验；目标计划状态已变化（如已激活）或文件编码异常时，原快照保持不动。
+
 ## API 概览
 
 成功响应：
@@ -188,6 +223,7 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 - 一个节点同一时刻最多有一个 `claimed` 租约。
 - 相同请求键和相同内容可安全重放；同键异载荷返回 `idempotency_conflict`。
 - 一致性判定综合节点覆盖率、序列号、成功比例和最大延迟，返回 `consistent` 或 `review_required`。
+- 离线导入命令复用同一套领域校验，解析失败、确认前放弃、版本冲突或编码异常都不会修改快照。
 - 所有校验和冲突在快照替换前返回，不留下部分状态。
 
 ## 后续工程任务的行为边界

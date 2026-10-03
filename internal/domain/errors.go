@@ -3,6 +3,8 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 )
 
 type ErrorCode string
@@ -46,6 +48,25 @@ func ErrorCodeOf(err error) ErrorCode {
 		return target.Code
 	}
 	return CodeInternal
+}
+
+// Describe renders an error with its domain details, so command line surfaces
+// can show the exact reason without decoding the structured error.
+func Describe(err error) string {
+	var target *DomainError
+	if !errors.As(err, &target) || len(target.Details) == 0 {
+		return err.Error()
+	}
+	keys := make([]string, 0, len(target.Details))
+	for key := range target.Details {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", key, target.Details[key]))
+	}
+	return fmt.Sprintf("%s (%s)", target.Message, strings.Join(parts, ", "))
 }
 
 func NotFound(entity string, id string) *DomainError {

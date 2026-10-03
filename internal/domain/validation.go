@@ -86,53 +86,11 @@ func NormalizeRevisionInput(input RevisionCreateInput) (RevisionCreateInput, err
 	input.Authority = canonicalName(input.Authority)
 	entries := make([]ZoneEntry, 0, len(input.Entries))
 	for _, entry := range input.Entries {
-		owner := canonicalName(entry.Owner)
-		entryType := EntryType(strings.ToUpper(strings.TrimSpace(string(entry.Type))))
-		value := strings.TrimSpace(entry.Value)
-		switch entryType {
-		case EntryA:
-			parsed := net.ParseIP(value)
-			if parsed == nil || parsed.To4() == nil {
-				return RevisionCreateInput{}, Validation("zone entry is invalid", map[string]any{
-					"owner": owner,
-					"type":  entryType,
-					"value": "must be a valid IPv4 address",
-				})
-			}
-			value = parsed.To4().String()
-		case EntryAAAA:
-			parsed := net.ParseIP(value)
-			if parsed == nil || parsed.To4() != nil {
-				return RevisionCreateInput{}, Validation("zone entry is invalid", map[string]any{
-					"owner": owner,
-					"type":  entryType,
-					"value": "must be a valid IPv6 address",
-				})
-			}
-			value = parsed.String()
-		case EntryCNAME:
-			value = canonicalName(value)
-			if err := validateCanonicalName(value); err != nil {
-				return RevisionCreateInput{}, Validation("zone entry is invalid", map[string]any{
-					"owner": owner,
-					"type":  entryType,
-					"value": err.Error(),
-				})
-			}
-		default:
-			return RevisionCreateInput{}, Validation("zone entry is invalid", map[string]any{
-				"owner": owner,
-				"type":  entry.Type,
-				"value": "type must be A, AAAA, or CNAME",
-			})
+		normalized, err := NormalizeEntry(entry.Owner, string(entry.Type), entry.Value)
+		if err != nil {
+			return RevisionCreateInput{}, err
 		}
-		if err := validateCanonicalName(owner); err != nil {
-			return RevisionCreateInput{}, Validation("zone entry is invalid", map[string]any{
-				"owner": owner,
-				"value": err.Error(),
-			})
-		}
-		entries = append(entries, ZoneEntry{Owner: owner, Type: entryType, Value: value})
+		entries = append(entries, normalized)
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].Owner != entries[j].Owner {
@@ -154,6 +112,59 @@ func NormalizeRevisionInput(input RevisionCreateInput) (RevisionCreateInput, err
 	}
 	input.Entries = entries
 	return input, nil
+}
+
+// NormalizeEntry canonicalizes one zone entry with the same rules used by the
+// JSON revision endpoint: names are lowercased and stripped of a trailing dot,
+// addresses are parsed into their canonical form, and the type is uppercased.
+func NormalizeEntry(owner string, entryType string, value string) (ZoneEntry, error) {
+	owner = canonicalName(owner)
+	normalizedType := EntryType(strings.ToUpper(strings.TrimSpace(entryType)))
+	value = strings.TrimSpace(value)
+	switch normalizedType {
+	case EntryA:
+		parsed := net.ParseIP(value)
+		if parsed == nil || parsed.To4() == nil {
+			return ZoneEntry{}, Validation("zone entry is invalid", map[string]any{
+				"owner": owner,
+				"type":  normalizedType,
+				"value": "must be a valid IPv4 address",
+			})
+		}
+		value = parsed.To4().String()
+	case EntryAAAA:
+		parsed := net.ParseIP(value)
+		if parsed == nil || parsed.To4() != nil {
+			return ZoneEntry{}, Validation("zone entry is invalid", map[string]any{
+				"owner": owner,
+				"type":  normalizedType,
+				"value": "must be a valid IPv6 address",
+			})
+		}
+		value = parsed.String()
+	case EntryCNAME:
+		value = canonicalName(value)
+		if err := validateCanonicalName(value); err != nil {
+			return ZoneEntry{}, Validation("zone entry is invalid", map[string]any{
+				"owner": owner,
+				"type":  normalizedType,
+				"value": err.Error(),
+			})
+		}
+	default:
+		return ZoneEntry{}, Validation("zone entry is invalid", map[string]any{
+			"owner": owner,
+			"type":  entryType,
+			"value": "type must be A, AAAA, or CNAME",
+		})
+	}
+	if err := validateCanonicalName(owner); err != nil {
+		return ZoneEntry{}, Validation("zone entry is invalid", map[string]any{
+			"owner": owner,
+			"value": err.Error(),
+		})
+	}
+	return ZoneEntry{Owner: owner, Type: normalizedType, Value: value}, nil
 }
 
 func ValidateRevisionInput(input RevisionCreateInput) error {
@@ -264,6 +275,15 @@ func validateRequestKey(value string) error {
 		return Validation("may contain only letters, digits, hyphens, and underscores", nil)
 	}
 	return nil
+}
+
+// CanonicalName normalizes a DNS name and validates it with the shared rules.
+func CanonicalName(value string) (string, error) {
+	name := canonicalName(value)
+	if err := validateCanonicalName(name); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 func canonicalName(value string) string {

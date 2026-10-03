@@ -212,11 +212,27 @@ ready --lease--> leased --report--> ready
 
 失败行为：缺少区域版本、没有探针、请求键冲突或保存失败不会更新计划摘要。
 
+### W5 离线区域文件导入
+
+入口：`go run ./cmd/zrcimport --plan <id> --file <zone> --serial <n> --authority <name>`。
+
+步骤：
+
+1. 文件在打开快照前完成 UTF-8 编码检查，随后解析注释、`$ORIGIN`、`$TTL`、`@`、相对名称、owner 继承和括号分组。
+2. 解析结果在内存中逐条复用领域规范化，完成重复检查、容量限制和与 JSON 接口统一的校验。
+3. 输出将创建的版本摘要和内容指纹，确认后才调用计划服务写入。
+4. 写入事务按预览时的计划版本做乐观并发校验，完全相同的已存版本按 `duplicate_revision` 识别。
+
+成功行为：草稿计划获得一个与 JSON 录入完全等价的新区域版本。
+
+失败行为：语法或值错误定位到行号；编码异常、计划状态变化、确认放弃或校验失败都保留原快照，不产生部分入库。
+
 ## 6. 模块边界
 
 | 模块 | 路径 | 责任 |
 | --- | --- | --- |
 | entry | `cmd/zrc` | 进程启动、参数解析、信号关闭 |
+| import | `cmd/zrcimport` | 离线区域文件导入、摘要预览和确认写入 |
 | httpapi | `internal/httpapi` | 路由、严格解码、中间件和错误映射 |
 | plan | `internal/plan` | 计划生命周期和区域版本规则 |
 | fleet | `internal/fleet` | 解析节点档案、唯一名称和分页查询 |
@@ -226,6 +242,7 @@ ready --lease--> leased --report--> ready
 | domain | `internal/domain` | 聚合、值校验、状态迁移和纯计算 |
 | store | `internal/store` | 锁内副本事务和原子 JSON 持久化 |
 | platform | `internal/platform` | 时钟、标识、游标和文件锁 |
+| zonefile | `internal/zonefile` | 传统区域文件解析、行号定位和内存规范化 |
 | runtime-probe | `internal/workflowprobe`, `cmd/workflowprobe` | 真实 HTTP 路径验证 |
 
 依赖方向：入口和 HTTP 层依赖应用服务；应用服务依赖领域规则和存储；领域包不依赖 HTTP、文件系统或网络。

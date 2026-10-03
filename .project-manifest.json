@@ -9,6 +9,11 @@
       "responsibility": "server process startup, flags, and graceful shutdown"
     },
     {
+      "id": "import",
+      "path": "cmd/zrcimport",
+      "responsibility": "offline zone file import with preview and confirmed write"
+    },
+    {
       "id": "httpapi",
       "path": "internal/httpapi",
       "responsibility": "HTTP routes, strict decoding, middleware, and error mapping"
@@ -52,6 +57,11 @@
       "id": "platform",
       "path": "internal/platform",
       "responsibility": "clock, identifiers, cursors, and process locking"
+    },
+    {
+      "id": "zonefile",
+      "path": "internal/zonefile",
+      "responsibility": "master file parsing, line-located errors, and in-memory normalization"
     },
     {
       "id": "runtime-probe",
@@ -153,6 +163,28 @@
         "probe",
         "domain",
         "storage"
+      ]
+    },
+    {
+      "id": "zone-file-import",
+      "name": "Offline zone file import",
+      "entry": "zrcimport --plan <id> --file <zone> --serial <n> --authority <name>",
+      "steps": [
+        "validate UTF-8 encoding before opening the snapshot",
+        "parse comments, directives, origins, and inherited owners with line numbers",
+        "normalize, deduplicate, and capacity-check entries in memory with the shared domain rules",
+        "print the revision summary and fingerprint, then write through the plan service after confirmation"
+      ],
+      "success": "the draft plan gains a revision equivalent to JSON entry, and re-importing the same file is recognized as a no-op",
+      "failure": "syntax errors report their line, and encoding problems, plan state changes, or stale previews leave the snapshot untouched",
+      "verification": "manual end-to-end runs of zrcimport against a temporary state file covering success, duplicate, syntax, encoding, and state-change cases",
+      "module_ids": [
+        "import",
+        "zonefile",
+        "plan",
+        "domain",
+        "storage",
+        "platform"
       ]
     }
   ]
