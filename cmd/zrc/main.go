@@ -1,129 +1,45 @@
 package main
 
 import (
-	"context"
 	"errors"
-	"flag"
 	"fmt"
-	"log/slog"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
-	"solo-0014-zone-rollout-control/internal/allocation"
-	"solo-0014-zone-rollout-control/internal/assessment"
-	"solo-0014-zone-rollout-control/internal/fleet"
-	"solo-0014-zone-rollout-control/internal/httpapi"
-	"solo-0014-zone-rollout-control/internal/plan"
-	"solo-0014-zone-rollout-control/internal/platform"
-	"solo-0014-zone-rollout-control/internal/probe"
-	"solo-0014-zone-rollout-control/internal/store"
+	"strings"
 )
 
 func main() {
-	if err := run(); err != nil {
+	if err := dispatch(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	var (
-		address        string
-		snapshotPath   string
-		shutdownWindow time.Duration
-	)
-	flag.StringVar(&address, "addr", "127.0.0.1:8090", "HTTP listen address")
-	flag.StringVar(&snapshotPath, "state", "data/zrc-state.json", "state snapshot path")
-	flag.DurationVar(&shutdownWindow, "shutdown-timeout", 10*time.Second, "graceful shutdown window")
-	flag.Parse()
-	if shutdownWindow <= 0 {
-		return errors.New("shutdown-timeout must be positive")
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	lock, err := platform.LockFile(snapshotPath + ".lock")
-	if err != nil {
-		return fmt.Errorf("lock snapshot: %w", err)
-	}
-	defer lock.Unlock()
-
-	stateStore, err := store.Open(snapshotPath)
-	if err != nil {
-		return fmt.Errorf("open store: %w", err)
-	}
-	clock := platform.SystemClock{}
-	ids := platform.CryptoIDGenerator{}
-	plans := plan.New(stateStore, clock, ids)
-	nodes := fleet.New(stateStore, clock, ids)
-	allocations := allocation.New(stateStore, clock, ids)
-	probes := probe.New(stateStore, clock, ids, allocations)
-	assessments := assessment.New(stateStore, clock, ids)
-	api := httpapi.New(plans, nodes, allocations, probes, assessments, ids, logger)
-
-	server := &http.Server{
-		Addr:              address,
-		Handler:           api.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-	rootContext, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-	go expireFunction(rootContext, allocations, logger)
-
-	serverResult := make(chan error, 1)
-	go func() {
-		logger.Info("server listening", "address", address, "state_path", snapshotPath)
-		err := server.ListenAndServe()
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverResult <- err
-			return
+// dispatch keeps the legacy flag-based server invocation working while adding
+// offline subcommands. A first positional argument that names a known
+// subcommand enters that tool; everything else starts the HTTP server exactly
+// as before.
+func dispatch(args []string) error {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "import-zone":
+			return runImportZone(args[1:])
+		case "-h", "--help", "help":
+			printRootUsage(os.Stdout)
+			return nil
 		}
-		serverResult <- nil
-	}()
-
-	select {
-	case err := <-serverResult:
-		if err != nil {
-			return fmt.Errorf("serve HTTP: %w", err)
-		}
+	}
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
+		printRootUsage(os.Stdout)
 		return nil
-	case <-rootContext.Done():
-		logger.Info("shutdown requested")
 	}
-
-	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), shutdownWindow)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownContext); err != nil {
-		return fmt.Errorf("shutdown HTTP server: %w", err)
-	}
-	if err := <-serverResult; err != nil {
-		return fmt.Errorf("serve HTTP: %w", err)
-	}
-	logger.Info("server stopped")
-	return nil
+	return runServer(args)
 }
 
-func expireFunction(ctx context.Context, service *allocation.Service, logger *slog.Logger) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			count, err := service.ExpireDue(ctx)
-			if err != nil {
-				logger.Error("lease expiry sweep failed", "error", err)
-				continue
-			}
-			if count > 0 {
-				logger.Info("expired leases", "count", count)
-			}
-		}
-	}
+func printRootUsage(file *os.File) {
+	fmt.Fprintf(file, "usage:\n")
+	fmt.Fprintf(file, "  %s [server flags]                 start the HTTP control plane\n", os.Args[0])
+	fmt.Fprintf(file, "  %s import-zone [flags] <zonefile> offline import of a zone file\n", os.Args[0])
+	fmt.Fprintf(file, "\nrun '%[1]s import-zone --help' for import options.\n", os.Args[0])
 }
+
+var errConfirmedRequired = errors.New("import requires confirmation; pass --yes to confirm non-interactively")

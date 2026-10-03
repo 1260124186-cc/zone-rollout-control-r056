@@ -52,6 +52,120 @@ func (s *Service) AddRevision(
 	planID string,
 	input domain.RevisionCreateInput,
 ) (domain.ZoneRevision, error) {
+	return s.addRevision(ctx, planID, input, nil)
+}
+
+// ImportRevision writes a revision prepared from an offline zone file. It goes
+// through the same normalization and validation as AddRevision; the source
+// attributes are attached to the audit event so imported revisions remain
+// traceable. It is the single "formal model" write path for imports.
+func (s *Service) ImportRevision(
+	ctx context.Context,
+	planID string,
+	input domain.RevisionCreateInput,
+	source ImportSource,
+) (domain.ZoneRevision, error) {
+	return s.addRevision(ctx, planID, input, &source)
+}
+
+// ImportSource records where an imported revision came from.
+type ImportSource struct {
+	FileName        string
+	FileFingerprint string
+	ContentDigest   string
+	ExpectedVersion uint64
+}
+
+// RevisionPreview is the dry-run view shown before a revision is written.
+type RevisionPreview struct {
+	PlanID        string
+	PlanState     domain.PlanState
+	PlanVersion   uint64
+	Serial        uint32
+	Authority     string
+	Entries       []domain.ZoneEntry
+	EntryCount    int
+	ContentDigest string
+	// DuplicateRevisionID is set when identical content already exists.
+	DuplicateRevisionID string
+	// DuplicateSerial is the serial carried by the existing content-matched
+	// revision (equal to Serial for a same-serial replay).
+	DuplicateSerial uint32
+	// DuplicateSameSerial distinguishes a same-serial exact replay (the hard
+	// duplicate_revision rule) from a cross-serial content match (a file that
+	// was imported before under another serial).
+	DuplicateSameSerial bool
+	LatestSerial        uint32
+}
+
+// PreviewRevision performs every revision check in memory without modifying
+// state. Offline imports use it to render the "what would be created" summary
+// and to recognize repeated imports: an exact content match returns the
+// existing revision id instead of proposing a new one.
+func (s *Service) PreviewRevision(
+	ctx context.Context,
+	planID string,
+	input domain.RevisionCreateInput,
+) (RevisionPreview, error) {
+	normalized, err := domain.NormalizeRevisionInput(input)
+	if err != nil {
+		return RevisionPreview{}, err
+	}
+	if err := domain.ValidateRevisionInput(normalized); err != nil {
+		return RevisionPreview{}, err
+	}
+	preview := RevisionPreview{
+		PlanID:        planID,
+		Serial:        normalized.Serial,
+		Authority:     normalized.Authority,
+		Entries:       append([]domain.ZoneEntry(nil), normalized.Entries...),
+		EntryCount:    len(normalized.Entries),
+		ContentDigest: RevisionDigestInput(normalized),
+	}
+	err = s.store.Read(ctx, func(state *domain.State) error {
+		plan, ok := state.Plans[planID]
+		if !ok {
+			return domain.NotFound("plan", planID)
+		}
+		preview.PlanState = plan.State
+		preview.PlanVersion = plan.Version
+		check, checkErr := checkRevisionCandidates(state, planID, normalized)
+		if checkErr != nil {
+			return checkErr
+		}
+		if check.sameSerialMatchID != "" {
+			preview.DuplicateRevisionID = check.sameSerialMatchID
+			preview.DuplicateSameSerial = true
+			preview.DuplicateSerial = normalized.Serial
+		} else if check.contentMatchID != "" {
+			preview.DuplicateRevisionID = check.contentMatchID
+			if existing, ok := state.Revisions[check.contentMatchID]; ok {
+				preview.DuplicateSerial = existing.Serial
+			}
+		}
+		preview.LatestSerial = check.latestSerial
+		return nil
+	})
+	return preview, err
+}
+
+type revisionCheck struct {
+	// sameSerialMatchID is an existing revision with the same serial AND exact
+	// content: the idempotent replay case shared by JSON and file imports.
+	sameSerialMatchID string
+	// contentMatchID is an existing revision with different serial but exact
+	// normalized content. Offline imports use it to recognize a file that was
+	// already imported; the JSON endpoint treats another serial as new.
+	contentMatchID string
+	latestSerial   uint32
+}
+
+func (s *Service) addRevision(
+	ctx context.Context,
+	planID string,
+	input domain.RevisionCreateInput,
+	source *ImportSource,
+) (domain.ZoneRevision, error) {
 	normalized, err := domain.NormalizeRevisionInput(input)
 	if err != nil {
 		return domain.ZoneRevision{}, err
@@ -66,28 +180,25 @@ func (s *Service) AddRevision(
 		if !ok {
 			return domain.NotFound("plan", planID)
 		}
+		if source != nil && source.ExpectedVersion != 0 && plan.Version != source.ExpectedVersion {
+			return versionConflict(planID, source.ExpectedVersion, plan.Version)
+		}
 		if plan.State != domain.PlanDraft {
 			return domain.InvalidState("revisions can be added only while plan is draft", map[string]any{
 				"plan_id": planID,
 				"state":   plan.State,
 			})
 		}
-		for _, revision := range state.Revisions {
-			if revision.PlanID != planID {
-				continue
-			}
-			if revision.Serial == normalized.Serial {
-				return domain.NewError(domain.CodeDuplicateRevision, "plan already contains this serial", map[string]any{
-					"plan_id": planID,
-					"serial":  normalized.Serial,
-				})
-			}
-			if revision.Serial > normalized.Serial {
-				return domain.Validation("revision serial must increase", map[string]any{
-					"serial": normalized.Serial,
-					"latest": revision.Serial,
-				})
-			}
+		check, err := checkRevisionCandidates(state, planID, normalized)
+		if err != nil {
+			return err
+		}
+		if check.sameSerialMatchID != "" {
+			return domain.NewError(domain.CodeDuplicateRevision, "revision content already exists for this plan", map[string]any{
+				"plan_id":     planID,
+				"serial":      normalized.Serial,
+				"revision_id": check.sameSerialMatchID,
+			})
 		}
 		created = domain.ZoneRevision{
 			ID:         s.ids.New("rev"),
@@ -102,13 +213,60 @@ func (s *Service) AddRevision(
 		plan.LatestRevisionID = created.ID
 		plan.Version++
 		state.Plans[planID] = plan
-		store.AddAudit(state, s.ids, "revision", created.ID, "added", now, map[string]any{
+		attributes := map[string]any{
 			"plan_id": planID,
 			"serial":  created.Serial,
-		})
+		}
+		if source != nil {
+			attributes["source"] = "zone_file"
+			attributes["file_name"] = source.FileName
+			attributes["file_fingerprint"] = source.FileFingerprint
+			attributes["content_digest"] = source.ContentDigest
+		}
+		store.AddAudit(state, s.ids, "revision", created.ID, "added", now, attributes)
 		return nil
 	})
 	return created, err
+}
+
+// checkRevisionCandidates enforces the plan's serial rules and computes
+// content identity. Same serial with different content rejects the replay;
+// same serial with identical content is the idempotent duplicate shared by
+// both entry points. Different serial with identical content is recorded
+// separately so offline imports can recognize a re-imported file without
+// changing the JSON endpoint's semantics (a new serial is a new revision).
+func checkRevisionCandidates(state *domain.State, planID string, normalized domain.RevisionCreateInput) (revisionCheck, error) {
+	result := revisionCheck{}
+	signature := contentSignature(normalized.Authority, normalized.Entries)
+	for _, revision := range state.Revisions {
+		if revision.PlanID != planID {
+			continue
+		}
+		if revision.Serial > result.latestSerial {
+			result.latestSerial = revision.Serial
+		}
+		sameContent := contentSignature(revision.Authority, revision.Entries) == signature
+		if revision.Serial == normalized.Serial {
+			if sameContent {
+				result.sameSerialMatchID = revision.ID
+				continue
+			}
+			return result, domain.NewError(domain.CodeDuplicateRevision, "plan already contains this serial with different content", map[string]any{
+				"plan_id": planID,
+				"serial":  normalized.Serial,
+			})
+		}
+		if revision.Serial > normalized.Serial {
+			return result, domain.Validation("revision serial must increase", map[string]any{
+				"serial": normalized.Serial,
+				"latest": revision.Serial,
+			})
+		}
+		if sameContent && result.contentMatchID == "" {
+			result.contentMatchID = revision.ID
+		}
+	}
+	return result, nil
 }
 
 func (s *Service) Activate(
@@ -279,6 +437,35 @@ func RevisionDigest(revision domain.ZoneRevision) string {
 		Serial:    revision.Serial,
 		Authority: revision.Authority,
 		Entries:   revision.Entries,
+	})
+	return string(payload)
+}
+
+// RevisionDigestInput computes the same identity payload for a normalized
+// revision candidate so preview and commit compare identical bytes.
+func RevisionDigestInput(input domain.RevisionCreateInput) string {
+	payload, _ := json.Marshal(struct {
+		Serial    uint32
+		Authority string
+		Entries   []domain.ZoneEntry
+	}{
+		Serial:    input.Serial,
+		Authority: input.Authority,
+		Entries:   input.Entries,
+	})
+	return string(payload)
+}
+
+// contentSignature identifies revision content independently of serial:
+// authority plus the normalized entries. It recognizes a zone file imported
+// again under a new serial.
+func contentSignature(authority string, entries []domain.ZoneEntry) string {
+	payload, _ := json.Marshal(struct {
+		Authority string
+		Entries   []domain.ZoneEntry
+	}{
+		Authority: authority,
+		Entries:   entries,
 	})
 	return string(payload)
 }
